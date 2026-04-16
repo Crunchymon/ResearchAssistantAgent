@@ -22,42 +22,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from config import NODE_ORDER, NODE_NAMES
-from graph import research_graph, reset_evaluator, get_evaluator
+from config import NODE_NAMES
+from core.state_transformer import build_initial_state, build_transition_state, normalize_node_event
+from core.orchestrator import PipelineOrchestrator
 from ui.components import inject_custom_css, render_section_divider
+from ui.render_dispatcher import render_completed_results
+from ui.session_state import init_session_state, reset_pipeline_state
 from ui.sidebar import render_sidebar_header, render_pipeline_tracker, render_sidebar_stats
-from ui.stages import (
-    render_query_stage,
-    render_decomposition_stage,
-    render_retrieval_stage,
-    render_processing_stage,
-    render_synthesis_stage,
-    render_outline_stage,
-    render_draft_stage,
-    render_review_stage,
-    render_final_report,
-    render_eval_summary_dashboard,
-)
 
 
-def init_session_state():
-    """Initialize Streamlit session state variables."""
-    defaults = {
-        "research_running": False,
-        "research_complete": False,
-        "completed_nodes": [],
-        "current_node": "",
-        "node_data": {},       # {node_name: output_data}
-        "eval_data": {},       # {node_name: eval_result_dict}
-        "transition_evals": {},  # {transition_name: transition_result}
-        "aggregate_eval": {},  # Overall pipeline eval scores
-        "final_state": None,
-        "retry_triggered": False,
-        "error_message": "",
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+PIPELINE = PipelineOrchestrator()
 
 
 def validate_api_keys() -> bool:
@@ -74,141 +48,71 @@ def validate_api_keys() -> bool:
     return True
 
 
-def run_research_pipeline(query: str):
+def _render_live_results(results_placeholder):
+    """Render current results into a dedicated live placeholder."""
+    if results_placeholder is None:
+        return
+
+    with results_placeholder.container():
+        if st.session_state.node_data:
+            render_completed_results(
+                node_data=st.session_state.node_data,
+                eval_data=st.session_state.eval_data,
+                research_complete=st.session_state.research_complete,
+                transition_evals=st.session_state.transition_evals,
+                aggregate_eval=st.session_state.aggregate_eval,
+                research_query=st.session_state.get("research_query", "research"),
+            )
+
+
+def run_research_pipeline(query: str, results_placeholder=None):
     """Execute the research pipeline with real-time UI updates and evals."""
+    reset_pipeline_state()
     st.session_state.research_running = True
-    st.session_state.research_complete = False
-    st.session_state.completed_nodes = []
-    st.session_state.current_node = ""
-    st.session_state.node_data = {}
-    st.session_state.eval_data = {}
-    st.session_state.transition_evals = {}
-    st.session_state.aggregate_eval = {}
-    st.session_state.final_state = None
-    st.session_state.retry_triggered = False
-    st.session_state.error_message = ""
 
     # Reset evaluator for fresh run
-    reset_evaluator()
+    PIPELINE.reset()
 
     # Initial state
-    initial_state = {
-        "query": query,
-        "refined_query": "",
-        "sub_questions": [],
-        "search_results": {},
-        "retrieval_stats": {},
-        "processed_data": {},
-        "insights": {},
-        "outline": {},
-        "draft": "",
-        "review_feedback": {},
-        "final_report": "",
-        "current_node": "",
-        "retry_count": 0,
-        "node_outputs": [],
-        "eval_results": [],
-    }
+    initial_state = build_initial_state(query)
 
     try:
-        # Stream the graph execution to get node-by-node updates
-        progress_placeholder = st.empty()
-        stage_container = st.container()
-
-        for event in research_graph.stream(initial_state, stream_mode="updates"):
+        for event in PIPELINE.stream_updates(initial_state):
             for node_name, node_output in event.items():
                 if node_name == "__end__":
                     continue
 
-                # Map internal node names to display names
-                display_node = node_name
-                if node_name == "increment_retry":
+                normalized = normalize_node_event(node_name, node_output)
+
+                if normalized.retry_triggered:
                     st.session_state.retry_triggered = True
                     continue
 
                 # Update tracking state
-                st.session_state.current_node = display_node
-                if display_node not in st.session_state.completed_nodes:
-                    st.session_state.completed_nodes.append(display_node)
+                st.session_state.current_node = normalized.node_name
+                if normalized.node_name not in st.session_state.completed_nodes:
+                    st.session_state.completed_nodes.append(normalized.node_name)
 
-                # Store node output data
-                if isinstance(node_output, dict):
-                    # Extract eval results
-                    eval_results = node_output.get("eval_results", [])
-                    if eval_results:
-                        latest_eval = eval_results[-1] if isinstance(eval_results, list) else eval_results
-                        st.session_state.eval_data[display_node] = latest_eval
+                if normalized.eval_result:
+                    st.session_state.eval_data[normalized.node_name] = normalized.eval_result
 
-                    # Extract the actual data from node_outputs log
-                    node_outputs = node_output.get("node_outputs", [])
-                    if node_outputs:
-                        latest = node_outputs[-1] if isinstance(node_outputs, list) else node_outputs
-                        st.session_state.node_data[display_node] = latest.get("data", node_output)
-                    else:
-                        st.session_state.node_data[display_node] = node_output
+                st.session_state.node_data[normalized.node_name] = normalized.raw_data
+                st.session_state.node_data.update(normalized.stage_updates)
 
-                    # Store specific fields for stage renderers
-                    if "refined_query" in node_output and node_output["refined_query"]:
-                        st.session_state.node_data["query_intake"] = {
-                            "refined_query": node_output["refined_query"],
-                        }
-                    if "sub_questions" in node_output and node_output["sub_questions"]:
-                        st.session_state.node_data["decomposition"] = {
-                            "sub_questions": node_output["sub_questions"],
-                        }
-                    if "search_results" in node_output:
-                        st.session_state.node_data["retrieval"] = {
-                            "search_results": node_output.get("search_results", {}),
-                            "retrieval_stats": node_output.get("retrieval_stats", {}),
-                        }
-                    if "processed_data" in node_output:
-                        st.session_state.node_data["processing"] = node_output["processed_data"]
-                    if "insights" in node_output:
-                        st.session_state.node_data["synthesis"] = node_output["insights"]
-                    if "outline" in node_output and node_output.get("outline"):
-                        st.session_state.node_data["outline"] = node_output["outline"]
-                    if "draft" in node_output and node_output.get("draft"):
-                        st.session_state.node_data["draft"] = node_output["draft"]
-                    if "review_feedback" in node_output:
-                        st.session_state.node_data["review"] = node_output["review_feedback"]
-                    if "final_report" in node_output and node_output.get("final_report"):
-                        st.session_state.node_data["final_report"] = node_output["final_report"]
+                # Progressive stage rendering: show each stage as soon as it arrives.
+                _render_live_results(results_placeholder)
 
         # ─── Run Workflow Transition Evals ────────────────
-        evaluator = get_evaluator()
         try:
-            # Build accumulated state for transition evals
-            accumulated_state = dict(initial_state)
-            for node_name_key in st.session_state.completed_nodes:
-                data = st.session_state.node_data.get(node_name_key, {})
-                if isinstance(data, dict):
-                    accumulated_state.update(data)
-
-            # Also pull specific top-level fields
-            if "query_intake" in st.session_state.node_data:
-                accumulated_state["refined_query"] = st.session_state.node_data["query_intake"].get("refined_query", "")
-            if "decomposition" in st.session_state.node_data:
-                accumulated_state["sub_questions"] = st.session_state.node_data["decomposition"].get("sub_questions", [])
-            if "retrieval" in st.session_state.node_data:
-                accumulated_state["search_results"] = st.session_state.node_data["retrieval"].get("search_results", {})
-                accumulated_state["retrieval_stats"] = st.session_state.node_data["retrieval"].get("retrieval_stats", {})
-            if "processing" in st.session_state.node_data:
-                proc = st.session_state.node_data["processing"]
-                accumulated_state["processed_data"] = proc if isinstance(proc, dict) else {}
-            if "synthesis" in st.session_state.node_data:
-                syn = st.session_state.node_data["synthesis"]
-                accumulated_state["insights"] = syn if isinstance(syn, dict) else {}
-            if "review" in st.session_state.node_data:
-                rev = st.session_state.node_data["review"]
-                accumulated_state["review_feedback"] = rev if isinstance(rev, dict) else {}
-            if "draft" in st.session_state.node_data:
-                accumulated_state["draft"] = st.session_state.node_data["draft"]
-            if "final_report" in st.session_state.node_data:
-                accumulated_state["final_report"] = st.session_state.node_data["final_report"]
+            accumulated_state = build_transition_state(
+                initial_state,
+                st.session_state.completed_nodes,
+                st.session_state.node_data,
+            )
 
             # Run transitions
             for transition_name in ["decomposition_to_retrieval", "processing_to_synthesis", "review_to_refinement"]:
-                t_result = evaluator.evaluate_transition(transition_name, accumulated_state)
+                t_result = PIPELINE.evaluate_transition(transition_name, accumulated_state)
                 if t_result:
                     st.session_state.transition_evals[transition_name] = {
                         "transition_name": t_result.transition_name,
@@ -226,69 +130,16 @@ def run_research_pipeline(query: str):
             pass  # Don't fail the pipeline for transition eval errors
 
         # Get aggregate scores
-        st.session_state.aggregate_eval = evaluator.get_aggregate_scores()
+        st.session_state.aggregate_eval = PIPELINE.aggregate_scores()
 
         st.session_state.research_complete = True
         st.session_state.research_running = False
+        _render_live_results(results_placeholder)
 
     except Exception as e:
         st.session_state.error_message = str(e)
         st.session_state.research_running = False
         st.error(f"❌ Pipeline error: {e}")
-
-
-def render_results():
-    """Render all completed stage results with eval scores."""
-    node_data = st.session_state.node_data
-    eval_data = st.session_state.eval_data
-
-    # N1: Query
-    if "query_intake" in node_data:
-        render_query_stage(node_data["query_intake"], eval_data.get("query_intake"))
-
-    # N2: Decomposition
-    if "decomposition" in node_data:
-        render_decomposition_stage(node_data["decomposition"], eval_data.get("decomposition"))
-
-    # N3: Retrieval
-    if "retrieval" in node_data:
-        render_retrieval_stage(node_data["retrieval"], eval_data.get("retrieval"))
-
-    # N4: Processing
-    if "processing" in node_data:
-        render_processing_stage(node_data["processing"], eval_data.get("processing"))
-
-    # N5: Synthesis
-    if "synthesis" in node_data:
-        render_synthesis_stage(node_data["synthesis"], eval_data.get("synthesis"))
-
-    # N6: Outline
-    if "outline" in node_data:
-        render_outline_stage(node_data["outline"], eval_data.get("outline"))
-
-    # N7: Draft
-    if "draft" in node_data:
-        render_draft_stage(node_data["draft"], eval_data.get("draft"))
-
-    # N8: Review
-    if "review" in node_data:
-        render_review_stage(node_data["review"], eval_data.get("review"))
-
-    # N9: Final Report
-    if "final_report" in node_data:
-        render_final_report(
-            node_data["final_report"],
-            st.session_state.get("research_query", "research"),
-            eval_data.get("refinement"),
-        )
-
-    # ─── Eval Summary Dashboard ──────────────────────────
-    if st.session_state.research_complete and eval_data:
-        render_eval_summary_dashboard(
-            eval_data=eval_data,
-            transition_evals=st.session_state.transition_evals,
-            aggregate=st.session_state.aggregate_eval,
-        )
 
 
 def main():
@@ -357,16 +208,24 @@ def main():
             """, unsafe_allow_html=True)
 
     render_section_divider()
+    live_results_placeholder = st.empty()
 
     # Run pipeline
     if start_button and query and not st.session_state.research_running:
         st.session_state.research_query = query
-        run_research_pipeline(query)
+        run_research_pipeline(query, live_results_placeholder)
         st.rerun()
 
     # Render results
     if st.session_state.node_data:
-        render_results()
+        render_completed_results(
+            node_data=st.session_state.node_data,
+            eval_data=st.session_state.eval_data,
+            research_complete=st.session_state.research_complete,
+            transition_evals=st.session_state.transition_evals,
+            aggregate_eval=st.session_state.aggregate_eval,
+            research_query=st.session_state.get("research_query", "research"),
+        )
 
     # Error display
     if st.session_state.error_message:
